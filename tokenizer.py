@@ -6,13 +6,6 @@ import json
 from multiprocessing import Pool
 import cupy as cp
 
-def merge_dicts(dicts):
-    merged = {}
-    for d in dicts:
-        for k, v in d.items():
-            merged[k] = merged.get(k, 0) + v
-    return merged
-
 class RegexTokenizer:
     merges = {}
     pattern = re.compile(r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+""") # gpt4 regex pattern
@@ -24,7 +17,8 @@ class RegexTokenizer:
         self.merges = self.train("output.txt", self.MAX_TOKEN_VALUE, True)
         self.special_tokens = {}
         self.vocab = self.create_vocab()
-    
+
+    # merges most common tokens into a new token, repeats until there are vocab_size tokens
     def train(self, file, vocab_size, verbose=False):
         f = open(file, "r", encoding="utf-8")
         text = f.read()
@@ -53,7 +47,8 @@ class RegexTokenizer:
         json.dump(merge_list, f)
         f.close()
         return merges
-    
+
+    # text -> tokens
     def encode(self, text):
         tokens = list(text.encode("utf-8"))
         while len(tokens) > 1:
@@ -63,12 +58,14 @@ class RegexTokenizer:
                 break # done merging
             tokens = self.merge(tokens, pair, self.merges[pair])
         return tokens
-            
+
+    # tokens -> text
     def decode(self, ids):
         tokens = b"".join([self.vocab[i] for i in ids])
         text = tokens.decode("utf-8", errors="replace")
         return text
-    
+
+    # basic pair counting
     def get_pair_counts(self, ids : list[int]):
         pairs = {}
         for pair in zip(ids, ids[1:]):
@@ -77,7 +74,8 @@ class RegexTokenizer:
         top_pair = max(pairs, key=pairs.get)
         print(type(top_pair))
         return pairs
-    
+
+    # gpu pair counting
     def gpu_pair_counts(self, ids):
         pairs = cp.zeros((self.MAX_TOKEN_VALUE, self.MAX_TOKEN_VALUE), dtype=cp.int32)
 
@@ -150,7 +148,8 @@ class RegexTokenizer:
         print(f"Time to count pairs: {time_end - time_start} seconds")
         
         return pairs
-    
+
+    # basic merge
     def merge(bytes, pair, index):
         new_bytes = []
         i = 0
@@ -162,7 +161,8 @@ class RegexTokenizer:
                 new_bytes.append(bytes[i])
                 i += 1
         return new_bytes
-    
+
+    # serial merge
     def regex_merge(self, bytes_list, pair, index):
         new_bytes = []
         for x in bytes_list:
@@ -177,7 +177,8 @@ class RegexTokenizer:
                     i += 1
             new_bytes.append(new_x)
         return new_bytes
-    
+
+    # gpu merge
     def gpu_merge(self, bytes_list, pair, index, batch_size=1000):
         # Convert pair and index to GPU arrays
         pair0, pair1 = pair
@@ -260,7 +261,7 @@ class RegexTokenizer:
         json.dump(vocab_str, f)
         f.close()
         return vocab
-    
+
     def chunk_merge(self, bytes, pair, index):
         new_bytes = []
         for x in bytes:
@@ -275,8 +276,16 @@ class RegexTokenizer:
                     i += 1
             new_bytes.append(new_x)
         return new_bytes
-    
+
+    # parallel merge
     def parallel_merge(self, ids, pair, index, num_workers=None):
+        def merge_dicts(dicts):
+            merged = {}
+            for d in dicts:
+                for k, v in d.items():
+                    merged[k] = merged.get(k, 0) + v
+            return merged
+
         if num_workers is None:
             num_workers = os.cpu_count()
             
@@ -298,7 +307,8 @@ class RegexTokenizer:
             for pair in zip(i, i[1:]):
                 pairs[pair] = pairs.get(pair, 0) + 1
         return pairs
-    
+
+    # parallel pair counting
     def parallel_pair_counts(self, ids, num_workers=None):
         if num_workers is None:
             num_workers = os.cpu_count()
