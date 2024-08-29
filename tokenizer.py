@@ -28,12 +28,14 @@ class RegexTokenizer:
             self.merges = self.train("output.txt", self.MAX_TOKEN_VALUE, True)
             self.vocab = self.create_vocab()
         self.special_tokens = {}
+        self.reverse_merges = {v: k for k, v in self.merges.items()}
+        self.counter = 0
         
     def parseMerges(self, file):
         f = open(file, "r")
         merge_list = json.load(f)
         f.close()
-        merges = {tuple(int(x) for x in key[1:-1].split(", ")): value for key, value in merge_list.items()}
+        merges = {tuple(int(x) for x in key[1:-1].split(", ")): int(value) for key, value in merge_list.items()}
         return merges
     
     def parseVocab(self, file):
@@ -43,7 +45,7 @@ class RegexTokenizer:
         vocab = {int(key): value.encode("utf-8") for key, value in vocab_list.items()}
         return vocab
     
-    def train(self, file, vocab_size, verbose=False):
+    def train(self, file, vocab_size, verbose=False) -> dict[tuple[int, int], int]:
         f = open(file, "r", encoding="utf-8")
         text = f.read()
         f.close()
@@ -73,14 +75,48 @@ class RegexTokenizer:
         return merges
     
     def encode(self, text):
+        if len(text) < 1000:
+            return self.small_encoder(text)
+        else:
+            return self.large_encoder(text)
+    
+    def small_encoder(self, text):
         tokens = list(text.encode("utf-8"))
         while len(tokens) > 1:
-            counts = self.gpu_pair_counts([tokens])
-            ndpair = cp.unravel_index(cp.argmax(counts), counts.shape)
-            pair = (int(ndpair[0]), int(ndpair[1]))
+            counts = self.get_pair_counts(tokens)
+            pair = min(counts, key=lambda x: self.merges.get(x, inf))
             if pair not in self.merges:
                 break # done merging
             tokens = self.merge(tokens, pair, self.merges[pair])
+        return tokens
+    
+    def large_encoder(self, text):
+        tokens = list(text.encode("utf-8"))
+        tokens = cp.array(tokens)
+        for i in range(257, self.MAX_TOKEN_VALUE):
+            print(i)
+            if len(tokens) <= 1:
+                break
+            counts = self.simple_pair_counts(tokens)
+            
+            #start_time = time.time()
+            pair = self.reverse_merges.get(i)
+            if counts[pair[0], pair[1]] == 0:
+                continue
+            #end_time = time.time()
+            #print(f"Time to find {pair}: {end_time - start_time} seconds")
+            
+            #start_time = time.time()
+            tokens = self.cupy_merge(tokens, pair, i)
+            #end_time = time.time()
+            #print(f"Time to merge {pair}: {end_time - start_time} seconds")
+        
+        tokens = tokens.tolist()
+        
+        f = open("bytes{self.counter}.json", "w")
+        json.dump(tokens, f)
+        f.close()
+        self.counter += 1
         return tokens
             
     def decode(self, ids):
@@ -170,6 +206,42 @@ class RegexTokenizer:
         
         return pairs
     
+    def simple_pair_counts(self, ids):
+        pairs = cp.zeros((self.MAX_TOKEN_VALUE, self.MAX_TOKEN_VALUE), dtype=cp.int32)
+
+        # Define a CUDA kernel for counting pairs
+        add_kernel_code = '''
+        extern "C" __global__
+        void count_pairs(const int *flat_ids, int *pairs, int num_elements, int max_value) {
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx < num_elements - 1) {
+                int i = flat_ids[idx];
+                int j = flat_ids[idx + 1];
+                atomicAdd(&pairs[i * max_value + j], 1);
+            }
+        }
+        '''
+        # Compile and get the kernel
+        count_pairs_kernel = cp.RawKernel(add_kernel_code, 'count_pairs')
+        time_start = time.time()
+        
+        # Prepare grid and block dimensions
+        num_elements = len(ids)
+        block_size = 256
+        grid_size = (num_elements + block_size - 1) // block_size
+        
+        # Launch the kernel
+        count_pairs_kernel(
+            (grid_size,), (block_size,),
+            (ids, pairs, num_elements, self.MAX_TOKEN_VALUE)
+        )
+        
+        cp.cuda.Device().synchronize()  # Wait for the GPU to finish
+        time_end = time.time()
+        print(f"Time to count pairs: {time_end - time_start} seconds")
+        
+        return pairs
+    
     def merge(self, bytes, pair, index):
         new_bytes = []
         i = 0
@@ -181,6 +253,52 @@ class RegexTokenizer:
                 new_bytes.append(bytes[i])
                 i += 1
         return new_bytes
+    
+    def cupy_merge(self, bytes, pair, index):
+        if type(bytes) == list:
+            bytes_cp = cp.array(bytes)
+        else:
+            bytes_cp = bytes
+
+        # Create a mask where the pair is found
+        mask = (bytes_cp[:-1] == pair[0]) & (bytes_cp[1:] == pair[1])
+        mask = mask.astype(cp.int32)
+        
+        # Define CUDA kernel for gpu merge
+        kernel_code = '''
+        extern "C" __global__
+        void gpu_merge_kernel(int *input, int *mask, int index, int length) {
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx < length - 1 && mask[idx]) {
+                input[idx] = index;
+                input[idx + 1] = -1;
+            }
+        }
+        '''
+        
+        # Compile and get the kernel
+        try:
+            gpu_merge_kernel = cp.RawKernel(kernel_code, 'gpu_merge_kernel')
+        except cp.cuda.runtime.CUDARuntimeError as e:
+            print(f"Error compiling CUDA kernel: {e}")
+            return
+        
+        # Launch kernel
+        block_size = 256
+        grid_size = (len(bytes_cp) + block_size - 1) // block_size
+
+        try:
+            gpu_merge_kernel(
+                (grid_size,), (block_size,),
+                (bytes_cp, mask, index, len(bytes_cp))
+            )
+        except cp.cuda.runtime.CUDARuntimeError as e:
+            print(f"Error launching CUDA kernel: {e}")
+            return
+        
+        cp.cuda.Device().synchronize() # Wait for the GPU to finish
+        
+        return bytes_cp[bytes_cp != -1]
     
     def regex_merge(self, bytes_list, pair, index):
         new_bytes = []
