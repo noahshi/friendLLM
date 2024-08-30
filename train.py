@@ -242,7 +242,7 @@ class FriendLLM:
         
         self.enc = RegexTokenizer("merges.json", "vocab.json")
         
-    def train_model(self, device):
+    def train_model(self, device, steps):
         import time
 
         train_loader = DataLoaderLite(B=16, T=512, file='bytes2.json')
@@ -253,8 +253,8 @@ class FriendLLM:
 
         max_lr = 6e-4
         min_lr = max_lr * 0.1
-        warmup_steps = 100
-        max_steps = 8000
+        warmup_steps = int(steps * 0.025)
+        max_steps = steps
 
         def get_lr(it):
             # warmup
@@ -291,24 +291,21 @@ class FriendLLM:
             print(f"step {step:4d}, loss: {loss.item()}, lr: {lr:.4e}, norm: {norm:.4f} dt: {((t1-t0)*1000):.4f}ms")
 
         torch.save(self.model.state_dict(), f'model_{max_steps}.pth')
-        # return model
 
     def load_model(self, file):
         self.model.load_state_dict(torch.load(file, weights_only=True))
-        # self.model.to(device)
-        # return model
         
     def prompt(self, prompt):
-        max_len = 200
-        repeats = 10
+        message_count = 0
+        message_count_cap = 20
 
         tokens = self.enc.encode(prompt)
-        tokens = torch.tensor(tokens).unsqueeze(0).repeat(repeats, 1)
+        tokens = torch.tensor(tokens).unsqueeze(0)
         x = tokens.to(self.device)
 
-        torch.manual_seed(42)
-        torch.cuda.manual_seed(42)
-        while x.size(1) < max_len:
+        # torch.manual_seed(42)
+        # torch.cuda.manual_seed(42)
+        while message_count < message_count_cap:
             with torch.no_grad():
                 logits, _ = self.model(x)
                 logits = logits[:, -1, :]
@@ -317,11 +314,13 @@ class FriendLLM:
                 ix = torch.multinomial(topk_probs, 1)
                 xcol = torch.gather(topk_indices, -1, ix)
                 x = torch.cat((x, xcol), dim=1)
+                
+                if xcol.item() in self.enc.eom_tokens:
+                    message_count += 1
 
-        for i in range(repeats):
-            tokens = x[i, :max_len].tolist()
-            decoded = self.enc.decode(tokens)
-            print(decoded)
+        tokens = x[0, :].tolist()
+        decoded = self.enc.decode(tokens)
+        print(decoded)
 
 bot = FriendLLM()
 bot.load_model('model_8000.pth')
