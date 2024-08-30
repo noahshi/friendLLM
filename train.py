@@ -227,96 +227,102 @@ class DataLoaderLite:
         return x, y
 
 # ------------------------------------------------------------------------------
-def train_model(device):
-    import time
-
-    train_loader = DataLoaderLite(B=16, T=512, file='bytes2.json')
-    torch.set_float32_matmul_precision('high')
-
-    # get logits
-    model = GPT(GPTConfig(vocab_size=10112))
-    model.to(device)
-
-    # torch.compile slows down training for some reason???
-    # model = torch.compile(model, backend="aot_eager")
-
-    max_lr = 6e-4
-    min_lr = max_lr * 0.1
-    warmup_steps = 100
-    max_steps = 8000
-
-    def get_lr(it):
-        # warmup
-        if it < warmup_steps:
-            return max_lr * (it + 1) / warmup_steps
-        # min learning rate
-        if it > max_steps:
-            return min_lr
-        # decay
-        decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-        assert 0 <= decay_ratio <= 1
-        coeff = 0.5 * (1 + math.cos(math.pi * decay_ratio))
-        return min_lr + coeff * (max_lr - min_lr)
-
-    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
-
-    for step in range(max_steps):
-        t0 = time.time()
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        optimizer.zero_grad()
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-        loss.backward()
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+class FriendLLM:
+    def __init__(self) -> None:
+        self.device = 'cpu'
+        if torch.cuda.is_available():
+            self.device = 'cuda'
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            self.device = 'mps'
+        print('using device:', self.device)
         
-        lr = get_lr(step)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-        optimizer.step()
+        # get logits
+        self.model = GPT(GPTConfig(vocab_size=10112))
+        self.model.to(self.device)
         
-        torch.cuda.synchronize()
-        t1 = time.time()
-        print(f"step {step:4d}, loss: {loss.item()}, lr: {lr:.4e}, norm: {norm:.4f} dt: {((t1-t0)*1000):.4f}ms")
+        self.enc = RegexTokenizer("merges.json", "vocab.json")
+        
+    def train_model(self, device):
+        import time
 
-    torch.save(model.state_dict(), f'model_{max_steps}.pth')
-    return model
+        train_loader = DataLoaderLite(B=16, T=512, file='bytes2.json')
+        torch.set_float32_matmul_precision('high')
 
-def load_model(device, file):
-    model = GPT(GPTConfig(vocab_size=10112))
-    model.load_state_dict(torch.load(file))
-    model.to(device)
-    return model
+        # torch.compile slows down training for some reason???
+        # model = torch.compile(model, backend="aot_eager")
 
-device = 'cpu'
-if torch.cuda.is_available():
-    device = 'cuda'
-elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-    device = 'mps'
-print('using device:', device)
-model = train_model(device)
-enc = RegexTokenizer("merges.json", "vocab.json")
+        max_lr = 6e-4
+        min_lr = max_lr * 0.1
+        warmup_steps = 100
+        max_steps = 8000
 
-max_len = 200
-repeats = 10
+        def get_lr(it):
+            # warmup
+            if it < warmup_steps:
+                return max_lr * (it + 1) / warmup_steps
+            # min learning rate
+            if it > max_steps:
+                return min_lr
+            # decay
+            decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+            assert 0 <= decay_ratio <= 1
+            coeff = 0.5 * (1 + math.cos(math.pi * decay_ratio))
+            return min_lr + coeff * (max_lr - min_lr)
 
-tokens = enc.encode("crystaltine:")
-tokens = torch.tensor(tokens).unsqueeze(0).repeat(repeats, 1)
-x = tokens.to(device)
+        optimizer = self.model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-while x.size(1) < max_len:
-    with torch.no_grad():
-        logits, _ = model(x)
-        logits = logits[:, -1, :]
-        probs = F.softmax(logits, dim=-1)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        ix = torch.multinomial(topk_probs, 1)
-        xcol = torch.gather(topk_indices, -1, ix)
-        x = torch.cat((x, xcol), dim=1)
+        for step in range(max_steps):
+            t0 = time.time()
+            x, y = train_loader.next_batch()
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad()
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                logits, loss = self.model(x, y)
+            loss.backward()
+            norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            
+            lr = get_lr(step)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
+            optimizer.step()
+            
+            torch.cuda.synchronize()
+            t1 = time.time()
+            print(f"step {step:4d}, loss: {loss.item()}, lr: {lr:.4e}, norm: {norm:.4f} dt: {((t1-t0)*1000):.4f}ms")
 
-for i in range(repeats):
-    tokens = x[i, :max_len].tolist()
-    decoded = enc.decode(tokens)
-    print(decoded)
+        torch.save(self.model.state_dict(), f'model_{max_steps}.pth')
+        # return model
+
+    def load_model(self, file):
+        self.model.load_state_dict(torch.load(file))
+        # self.model.to(device)
+        # return model
+        
+    def prompt(self, prompt):
+        max_len = 200
+        repeats = 10
+
+        tokens = self.enc.encode(prompt)
+        tokens = torch.tensor(tokens).unsqueeze(0).repeat(repeats, 1)
+        x = tokens.to(self.device)
+
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+        while x.size(1) < max_len:
+            with torch.no_grad():
+                logits, _ = self.model(x)
+                logits = logits[:, -1, :]
+                probs = F.softmax(logits, dim=-1)
+                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                ix = torch.multinomial(topk_probs, 1)
+                xcol = torch.gather(topk_indices, -1, ix)
+                x = torch.cat((x, xcol), dim=1)
+
+        for i in range(repeats):
+            tokens = x[i, :max_len].tolist()
+            decoded = self.enc.decode(tokens)
+            print(decoded)
+
+bot = FriendLLM()
+bot.load_model('model_8000.pth')
+bot.prompt("crystaltine:")
