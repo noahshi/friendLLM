@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import inspect
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -25,11 +26,8 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, T, T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
         
-        y = att @ v
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         return y
@@ -40,6 +38,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, config.n_embd * 4)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(config.n_embd * 4, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         
     def forward(self, x):
         x = self.c_fc(x)
@@ -64,7 +63,7 @@ class Block(nn.Module):
 class GPTConfig:
     block_size: int = 1024
     vocab_size: int = 10000
-    n_layers: int = 12
+    n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
 
@@ -77,10 +76,24 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layers)]),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight
+        
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
         
     def forward(self, idx, targets=None):
         # idx is of shape (B, T)
@@ -151,18 +164,49 @@ class GPT(nn.Module):
 
         return model
     
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # start with all of the candidate parameters (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        # if master_process:
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device == "cuda"
+        # if master_process:
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
+    
 # ------------------------------------------------------------------------------
 from tokenizer import RegexTokenizer
 
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, file=None):
         self.B = B
         self.T = T
+        self.enc = RegexTokenizer("merges.json", "vocab.json")
         
-        with open('output.txt', 'r', encoding='utf-8') as f:
-            text = f.read()
-        enc = RegexTokenizer("merges.json", "vocab.json")
-        tokens = enc.encode(text)
+        if file is not None:
+            import json
+            with open(file, 'r', encoding='utf-8') as f:
+                tokens = json.load(f)
+        else:
+            with open('output-merged.txt', 'r', encoding='utf-8') as f:
+                text = f.read()
+            tokens = self.enc.encode(text)
+        
         self.tokens = torch.tensor(tokens)
         print(f'loaded {len(tokens)} tokens')
         print(f'1 epoch = {len(tokens) // (B * T)} batches')
@@ -174,48 +218,97 @@ class DataLoaderLite:
         buf = self.tokens[self.current_position:self.current_position + B*T + 1]
         x = buf[:-1].view(B, T) # inputs
         y = buf[1:].view(B, T) # targets
+        
         # move position forwards
         self.current_position += B*T
         # reset if out of bounds
-        if self.current_position >= len(self.tokens):
+        if self.current_position + B*T + 1 >= len(self.tokens):
             self.current_position = 0
         return x, y
 
 # ------------------------------------------------------------------------------
+def train_model(device):
+    import time
+
+    train_loader = DataLoaderLite(B=16, T=512, file='bytes2.json')
+    torch.set_float32_matmul_precision('high')
+
+    # get logits
+    model = GPT(GPTConfig(vocab_size=10112))
+    model.to(device)
+
+    # torch.compile slows down training for some reason???
+    # model = torch.compile(model, backend="aot_eager")
+
+    max_lr = 6e-4
+    min_lr = max_lr * 0.1
+    warmup_steps = 100
+    max_steps = 8000
+
+    def get_lr(it):
+        # warmup
+        if it < warmup_steps:
+            return max_lr * (it + 1) / warmup_steps
+        # min learning rate
+        if it > max_steps:
+            return min_lr
+        # decay
+        decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1 + math.cos(math.pi * decay_ratio))
+        return min_lr + coeff * (max_lr - min_lr)
+
+    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+
+    for step in range(max_steps):
+        t0 = time.time()
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss.backward()
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        optimizer.step()
+        
+        torch.cuda.synchronize()
+        t1 = time.time()
+        print(f"step {step:4d}, loss: {loss.item()}, lr: {lr:.4e}, norm: {norm:.4f} dt: {((t1-t0)*1000):.4f}ms")
+
+    torch.save(model.state_dict(), f'model_{max_steps}.pth')
+    return model
+
+def load_model(device, file):
+    model = GPT(GPTConfig(vocab_size=10112))
+    model.load_state_dict(torch.load(file))
+    model.to(device)
+    return model
+
 device = 'cpu'
 if torch.cuda.is_available():
     device = 'cuda'
 elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
     device = 'mps'
 print('using device:', device)
+model = train_model(device)
+enc = RegexTokenizer("merges.json", "vocab.json")
 
-train_loader = DataLoaderLite(B=4, T=32)
+max_len = 200
+repeats = 10
 
-# get logits
-model = GPT(GPTConfig())
-model.to(device)
-
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
-    optimizer.zero_grad()
-    logits, loss = model(x, y)
-    loss.backward()
-    optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
-
-import sys; sys.exit(0)
-
-max_len = 30
-repeats = 5
-
+tokens = enc.encode("crystaltine:")
+tokens = torch.tensor(tokens).unsqueeze(0).repeat(repeats, 1)
+x = tokens.to(device)
 
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
 while x.size(1) < max_len:
     with torch.no_grad():
-        logits = model(x)
+        logits, _ = model(x)
         logits = logits[:, -1, :]
         probs = F.softmax(logits, dim=-1)
         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
@@ -226,4 +319,4 @@ while x.size(1) < max_len:
 for i in range(repeats):
     tokens = x[i, :max_len].tolist()
     decoded = enc.decode(tokens)
-    print(">", decoded)
+    print(decoded)

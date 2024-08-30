@@ -94,7 +94,7 @@ class RegexTokenizer:
         tokens = list(text.encode("utf-8"))
         tokens = cp.array(tokens)
         for i in range(257, self.MAX_TOKEN_VALUE):
-            print(i)
+            # print(i)
             if len(tokens) <= 1:
                 break
             counts = self.simple_pair_counts(tokens)
@@ -223,7 +223,7 @@ class RegexTokenizer:
         '''
         # Compile and get the kernel
         count_pairs_kernel = cp.RawKernel(add_kernel_code, 'count_pairs')
-        time_start = time.time()
+        # time_start = time.time()
         
         # Prepare grid and block dimensions
         num_elements = len(ids)
@@ -237,8 +237,8 @@ class RegexTokenizer:
         )
         
         cp.cuda.Device().synchronize()  # Wait for the GPU to finish
-        time_end = time.time()
-        print(f"Time to count pairs: {time_end - time_start} seconds")
+        # time_end = time.time()
+        # print(f"Time to count pairs: {time_end - time_start} seconds")
         
         return pairs
     
@@ -456,6 +456,3 @@ class RegexTokenizer:
         # merge all counts
         pairs = merge_dicts(results)
         return pairs
-
-# if __name__ == "__main__":
-#     tokenizer = RegexTokenizer()
