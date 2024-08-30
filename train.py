@@ -294,7 +294,7 @@ class FriendLLM:
         # return model
 
     def load_model(self, file):
-        self.model.load_state_dict(torch.load(file))
+        self.model.load_state_dict(torch.load(file, weights_only=True))
         # self.model.to(device)
         # return model
         
