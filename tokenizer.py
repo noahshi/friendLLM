@@ -30,6 +30,7 @@ class RegexTokenizer:
         self.special_tokens = {}
         self.reverse_merges = {v: k for k, v in self.merges.items()}
         self.counter = 0
+        self.eom_tokens =  [key for key, value in self.vocab.items() if '\n' in value.decode("utf-8")]
         
     def parseMerges(self, file):
         f = open(file, "r")
