@@ -20,7 +20,7 @@ class RegexTokenizer:
     vocab = {}
     MAX_TOKEN_VALUE = 10000
     
-    def __init__(self, merges_file=None, vocab_file=None):
+    def __init__(self, merges_file=None, vocab_file=None, banned_words_file=None):
         if merges_file and vocab_file:
             self.merges = self.parseMerges(merges_file)
             self.vocab = self.parseVocab(vocab_file)
@@ -30,7 +30,15 @@ class RegexTokenizer:
         self.special_tokens = {}
         self.reverse_merges = {v: k for k, v in self.merges.items()}
         self.counter = 0
-        self.eom_tokens =  [key for key, value in self.vocab.items() if '\n' in value.decode("utf-8")]
+        self.eom_tokens = [key for key, value in self.vocab.items() if '\n' in value.decode("utf-8")]
+        self.banned_tokens = []
+        
+        if banned_words_file:
+            with open(banned_words_file, "r") as f:
+                words = json.load(f)
+                for word in words:
+                    self.banned_tokens.extend([key for key, value in self.vocab.items() if word in value.decode("utf-8")])
+            
         
     def parseMerges(self, file):
         f = open(file, "r")
@@ -57,11 +65,9 @@ class RegexTokenizer:
         
         for i in range(num_merges):
             counts = self.gpu_pair_counts(ids)
-            # start_time = time.time()
             ndpair = cp.unravel_index(cp.argmax(counts), counts.shape)
             pair = (int(ndpair[0]), int(ndpair[1]))
-            # end_time = time.time()
-            # print(f"Time to find pair: {end_time - start_time} seconds")
+
             start_time = time.time()
             ids = self.regex_merge(ids, pair, 256+i)
             merges[pair] = 256+i
@@ -69,6 +75,7 @@ class RegexTokenizer:
             print(f"Time to merge: {end_time - start_time} seconds")
             if verbose:
                 print(f"Merging {pair} into token {256 + i}")
+        
         f = open("merges.json", "w")
         merge_list = {str(key): value for key, value in merges.items()}
         json.dump(merge_list, f)
@@ -95,22 +102,14 @@ class RegexTokenizer:
         tokens = list(text.encode("utf-8"))
         tokens = cp.array(tokens)
         for i in range(257, self.MAX_TOKEN_VALUE):
-            # print(i)
             if len(tokens) <= 1:
                 break
             counts = self.simple_pair_counts(tokens)
-            
-            #start_time = time.time()
             pair = self.reverse_merges.get(i)
             if counts[pair[0], pair[1]] == 0:
                 continue
-            #end_time = time.time()
-            #print(f"Time to find {pair}: {end_time - start_time} seconds")
-            
-            #start_time = time.time()
+
             tokens = self.cupy_merge(tokens, pair, i)
-            #end_time = time.time()
-            #print(f"Time to merge {pair}: {end_time - start_time} seconds")
         
         tokens = tokens.tolist()
         
@@ -130,8 +129,6 @@ class RegexTokenizer:
         for pair in zip(ids, ids[1:]):
             pairs[pair] = pairs.get(pair, 0) + 1
         
-        # top_pair = max(pairs, key=pairs.get)
-        # print(type(top_pair))
         return pairs
     
     def gpu_pair_counts(self, ids):
@@ -238,8 +235,6 @@ class RegexTokenizer:
         )
         
         cp.cuda.Device().synchronize()  # Wait for the GPU to finish
-        # time_end = time.time()
-        # print(f"Time to count pairs: {time_end - time_start} seconds")
         
         return pairs
     
@@ -399,61 +394,3 @@ class RegexTokenizer:
         json.dump(vocab_str, f)
         f.close()
         return vocab
-    
-    def chunk_merge(self, bytes, pair, index):
-        new_bytes = []
-        for x in bytes:
-            new_x = []
-            i = 0
-            while i < len(x):
-                if i < len(x) - 1 and x[i] == pair[0] and x[i+1] == pair[1]:
-                    new_x.append(index)
-                    i += 2
-                else:
-                    new_x.append(x[i])
-                    i += 1
-            new_bytes.append(new_x)
-        return new_bytes
-    
-    def parallel_merge(self, ids, pair, index, num_workers=None):
-        if num_workers is None:
-            num_workers = os.cpu_count()
-            
-        chunk_size = len(ids) // num_workers
-        chunks = [ids[i * chunk_size:(i + 1) * chunk_size] for i in range(num_workers)]
-        
-        if len(ids) % num_workers != 0:
-            chunks.append(ids[num_workers * chunk_size:])
-            
-        with Pool(num_workers) as pool:
-            results = pool.starmap(self.chunk_merge, [(chunk, pair, index) for chunk in chunks])
-        
-        new_bytes = [l for sublist in results for l in sublist]
-        return new_bytes
-    
-    def chunk_pair_counts(self, ids):
-        pairs = {}
-        for i in ids:
-            for pair in zip(i, i[1:]):
-                pairs[pair] = pairs.get(pair, 0) + 1
-        return pairs
-    
-    def parallel_pair_counts(self, ids, num_workers=None):
-        if num_workers is None:
-            num_workers = os.cpu_count()
-        
-        # create chunks
-        chunk_size = len(ids) // num_workers
-        chunks = [ids[i * chunk_size:(i + 1) * chunk_size] for i in range(num_workers)]
-        
-        # append extra strings to last chunk
-        if len(ids) % num_workers != 0:
-            chunks.append(ids[num_workers * chunk_size:])
-        
-        # start process pool
-        with Pool(num_workers) as pool:
-            results = pool.map(self.chunk_pair_counts, chunks)
-            
-        # merge all counts
-        pairs = merge_dicts(results)
-        return pairs

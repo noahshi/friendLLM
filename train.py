@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
+import random
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
@@ -240,9 +241,11 @@ class FriendLLM:
         self.model = GPT(GPTConfig(vocab_size=10112))
         self.model.to(self.device)
         
-        self.enc = RegexTokenizer("merges.json", "vocab.json")
+        self.enc = RegexTokenizer("merges.json", "vocab.json", "bad.json")
         
-    def train_model(self, device, steps):
+        print(self.enc.banned_tokens)
+        
+    def train_model(self, steps):
         import time
 
         train_loader = DataLoaderLite(B=16, T=512, file='bytes2.json')
@@ -269,14 +272,14 @@ class FriendLLM:
             coeff = 0.5 * (1 + math.cos(math.pi * decay_ratio))
             return min_lr + coeff * (max_lr - min_lr)
 
-        optimizer = self.model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+        optimizer = self.model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=self.device)
 
         for step in range(max_steps):
             t0 = time.time()
             x, y = train_loader.next_batch()
-            x, y = x.to(device), y.to(device)
+            x, y = x.to(self.device), y.to(self.device)
             optimizer.zero_grad()
-            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
                 logits, loss = self.model(x, y)
             loss.backward()
             norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -297,15 +300,23 @@ class FriendLLM:
         
     def prompt(self, prompt):
         message_count = 0
-        message_count_cap = 20
+        message_count_hard_cap = 60
 
         tokens = self.enc.encode(prompt)
         tokens = torch.tensor(tokens).unsqueeze(0)
         x = tokens.to(self.device)
+        
+        def get_stop_prob(it):
+            if it > message_count_hard_cap:
+                return 0
+
+            decay_ratio = it / message_count_hard_cap
+            assert 0 <= decay_ratio <= 1
+            return 0.5 * (1 + math.cos(math.pi * decay_ratio))
 
         # torch.manual_seed(42)
         # torch.cuda.manual_seed(42)
-        while message_count < message_count_cap:
+        while message_count < message_count_hard_cap:
             with torch.no_grad():
                 logits, _ = self.model(x)
                 logits = logits[:, -1, :]
@@ -313,9 +324,15 @@ class FriendLLM:
                 topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
                 ix = torch.multinomial(topk_probs, 1)
                 xcol = torch.gather(topk_indices, -1, ix)
+                if xcol.item() in self.enc.banned_tokens:
+                    print('bad token:', xcol.item())
+                    continue
+                
                 x = torch.cat((x, xcol), dim=1)
                 
                 if xcol.item() in self.enc.eom_tokens:
+                    if(random.random() > get_stop_prob(message_count)):
+                        break
                     message_count += 1
 
         tokens = x[0, :].tolist()
@@ -324,4 +341,4 @@ class FriendLLM:
 
 bot = FriendLLM()
 bot.load_model('model_8000.pth')
-bot.prompt("crystaltine:")
+bot.prompt("gqds:")
