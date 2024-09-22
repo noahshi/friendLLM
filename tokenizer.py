@@ -1,9 +1,7 @@
 from math import inf
-import os
 import time
 import regex as re
 import json
-from multiprocessing import Pool
 import cupy as cp
 
 def merge_dicts(dicts):
@@ -76,7 +74,7 @@ class RegexTokenizer:
             if verbose:
                 print(f"Merging {pair} into token {256 + i}")
         
-        f = open("merges.json", "w")
+        f = open("./data/merges.json", "w")
         merge_list = {str(key): value for key, value in merges.items()}
         json.dump(merge_list, f)
         f.close()
